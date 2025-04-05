@@ -47,14 +47,18 @@ def load_celeb_faces():
         if not os.path.isdir(celeb_path):
             continue
         for filename in os.listdir(celeb_path):
-            image_path = os.path.join(celeb_path, filename)
-            try:
-                image = face_recognition.load_image_file(image_path)
-                encodings = face_recognition.face_encodings(image)
-                if encodings:
-                    celeb_encodings.append((encodings[0], celeb_name, image_path))
-            except Exception as e:
-                print(f"Error loading celeb image {image_path}: {e}")
+            if not filename.lower().endswith((".jpg", ".jpeg", ".png")):
+                continue  # Skip non-image files like .DS_Store
+            
+        image_path = os.path.join(celeb_path, filename)
+        try:
+            image = face_recognition.load_image_file(image_path)
+            encodings = face_recognition.face_encodings(image)
+            if encodings:
+                celeb_encodings.append((encodings[0], celeb_name, image_path))
+        except Exception as e:
+            print(f"Error loading celeb image {image_path}: {e}")
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Choose an option:", reply_markup=keyboard)
