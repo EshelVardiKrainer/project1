@@ -9,6 +9,7 @@ from telegram.ext import (
     MessageHandler, filters
 )
 from dotenv import load_dotenv
+from sklearn.decomposition import PCA
 
 # Load token from .env
 load_dotenv()
@@ -19,12 +20,14 @@ keyboard = ReplyKeyboardMarkup([
     ['Add face'],
     ['Recognize faces'],
     ['Reset faces'],
-    ['Similar celebs']
+    ['Similar celebs'],
+    ['Map']
 ], resize_keyboard=True)
 
 # In-memory storage
 known_face_encodings = []
 known_face_names = []
+known_face_images = []  # store images for mapping
 user_state = {}
 celeb_encodings = []  # (encoding, celeb_name, image_path)
 
@@ -64,9 +67,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_state.get(user_id) == WAITING_FOR_NAME:
         name = text.strip()
         encoding = context.user_data.get('new_face_encoding')
-        if encoding is not None:
+        image = context.user_data.get('new_face_image')
+        if encoding is not None and image is not None:
             known_face_encodings.append(encoding)
             known_face_names.append(name)
+            known_face_images.append(image)
             await update.message.reply_text(
                 f"Great. I will now remember this face as {name}.",
                 reply_markup=keyboard
@@ -87,6 +92,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == 'Reset faces':
         known_face_encodings.clear()
         known_face_names.clear()
+        known_face_images.clear()
         await update.message.reply_text("All saved faces have been reset.", reply_markup=keyboard)
         user_state[user_id] = None
         return
@@ -94,6 +100,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == 'Similar celebs':
         user_state[user_id] = WAITING_FOR_CELEB_LOOKALIKE_IMAGE
         await update.message.reply_text("Upload me a picture of a single person and I will find which celebs are similar to that person")
+        return
+
+    elif text == 'Map':
+        await send_similarity_map(update)
         return
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -110,6 +120,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Please upload an image with exactly one face.")
             return
         context.user_data['new_face_encoding'] = encodings[0]
+        context.user_data['new_face_image'] = image
         await update.message.reply_text("Great. What's the name of the person in this image?")
         user_state[user_id] = WAITING_FOR_NAME
 
@@ -167,14 +178,44 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_photo(
                     photo=img_file,
                     caption=f"The celeb that the person is most similar to is: {best_match_name.replace('_', ' ').title()}",
-                    reply_markup=keyboard  # ✅ <- This line already exists, good!
+                    reply_markup=keyboard
                 )
-
         else:
             await update.message.reply_text("I couldn't find a similar celeb.", reply_markup=keyboard)
 
-
         user_state[user_id] = None
+
+async def send_similarity_map(update: Update):
+    encodings = known_face_encodings + [c[0] for c in celeb_encodings]
+    images = known_face_images + [face_recognition.load_image_file(c[2]) for c in celeb_encodings]
+    labels = known_face_names + [c[1] for c in celeb_encodings]
+
+    if len(encodings) < 2:
+        await update.message.reply_text("I need at least 2 faces to generate a map.", reply_markup=keyboard)
+        return
+
+    # Reduce to 2D
+    pca = PCA(n_components=2)
+    coords = pca.fit_transform(encodings)
+    coords -= coords.min(axis=0)
+    coords /= coords.max(axis=0)
+    coords *= 800  # canvas size
+
+    # Draw
+    canvas = Image.new('RGB', (850, 850), 'white')
+    for (x, y), image, label in zip(coords, images, labels):
+        face_locations = face_recognition.face_locations(image)
+        if not face_locations:
+            continue
+        top, right, bottom, left = face_locations[0]
+        face = Image.fromarray(image[top:bottom, left:right])
+        face = face.resize((64, 64))
+        canvas.paste(face, (int(x), int(y)))
+
+    output = io.BytesIO()
+    canvas.save(output, format="PNG")
+    output.seek(0)
+    await update.message.reply_photo(photo=output, caption="Here's a map of all known faces", reply_markup=keyboard)
 
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 
