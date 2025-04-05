@@ -6,7 +6,7 @@ import face_recognition
 from telegram import Update, ReplyKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     ApplicationBuilder, ContextTypes, CommandHandler,
-    MessageHandler, filters, ConversationHandler
+    MessageHandler, filters
 )
 from dotenv import load_dotenv
 
@@ -18,18 +18,40 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 keyboard = ReplyKeyboardMarkup([
     ['Add face'],
     ['Recognize faces'],
-    ['Reset faces']
+    ['Reset faces'],
+    ['Similar celebs']
 ], resize_keyboard=True)
 
 # In-memory storage
 known_face_encodings = []
 known_face_names = []
 user_state = {}
+celeb_encodings = []  # (encoding, celeb_name, image_path)
+
+# Paths
+CELEB_DIR = "celebs"
 
 # States
 WAITING_FOR_IMAGE = 1
 WAITING_FOR_NAME = 2
 WAITING_FOR_RECOGNITION_IMAGE = 3
+WAITING_FOR_CELEB_LOOKALIKE_IMAGE = 4
+
+# Load celeb face encodings on startup
+def load_celeb_faces():
+    for celeb_name in os.listdir(CELEB_DIR):
+        celeb_path = os.path.join(CELEB_DIR, celeb_name)
+        if not os.path.isdir(celeb_path):
+            continue
+        for filename in os.listdir(celeb_path):
+            image_path = os.path.join(celeb_path, filename)
+            try:
+                image = face_recognition.load_image_file(image_path)
+                encodings = face_recognition.face_encodings(image)
+                if encodings:
+                    celeb_encodings.append((encodings[0], celeb_name, image_path))
+            except Exception as e:
+                print(f"Error loading celeb image {image_path}: {e}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Choose an option:", reply_markup=keyboard)
@@ -39,7 +61,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     user_id = update.effective_user.id
 
-    # ✅ Check if we're waiting for a name
     if user_state.get(user_id) == WAITING_FOR_NAME:
         name = text.strip()
         encoding = context.user_data.get('new_face_encoding')
@@ -53,7 +74,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_state[user_id] = None
         return
 
-    # ✅ Handle button presses
     if text == 'Add face':
         user_state[user_id] = WAITING_FOR_IMAGE
         await update.message.reply_text("Upload an image with a single face")
@@ -69,6 +89,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         known_face_names.clear()
         await update.message.reply_text("All saved faces have been reset.", reply_markup=keyboard)
         user_state[user_id] = None
+        return
+
+    elif text == 'Similar celebs':
+        user_state[user_id] = WAITING_FOR_CELEB_LOOKALIKE_IMAGE
+        await update.message.reply_text("Upload me a picture of a single person and I will find which celebs are similar to that person")
         return
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -105,7 +130,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 best_match = np.argmin(distances)
                 names.append(known_face_names[best_match])
 
-        # Draw boxes
         pil_image = Image.fromarray(image)
         draw = ImageDraw.Draw(pil_image)
         for (top, right, bottom, left), name in zip(face_locations, names):
@@ -119,6 +143,38 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_photo(photo=output, caption=f"I found {len(names)} face(s): {', '.join(names)}", reply_markup=keyboard)
         user_state[user_id] = None
 
+    elif state == WAITING_FOR_CELEB_LOOKALIKE_IMAGE:
+        encodings = face_recognition.face_encodings(image)
+        if not encodings:
+            await update.message.reply_text("I couldn't detect any face in the image.", reply_markup=keyboard)
+            user_state[user_id] = None
+            return
+
+        query_encoding = encodings[0]
+        best_distance = float('inf')
+        best_match_name = None
+        best_match_image_path = None
+
+        for celeb_encoding, celeb_name, image_path in celeb_encodings:
+            distance = np.linalg.norm(query_encoding - celeb_encoding)
+            if distance < best_distance:
+                best_distance = distance
+                best_match_name = celeb_name
+                best_match_image_path = image_path
+
+        if best_match_name:
+            with open(best_match_image_path, 'rb') as img_file:
+                await update.message.reply_photo(
+                    photo=img_file,
+                    caption=f"The celeb that the person is most similar to is: {best_match_name.replace('_', ' ').title()}",
+                    reply_markup=keyboard  # ✅ <- This line already exists, good!
+                )
+
+        else:
+            await update.message.reply_text("I couldn't find a similar celeb.", reply_markup=keyboard)
+
+
+        user_state[user_id] = None
 
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -127,5 +183,7 @@ app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
 if __name__ == '__main__':
+    print("Loading celeb encodings...")
+    load_celeb_faces()
     print("Bot is running...")
     app.run_polling()
