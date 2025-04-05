@@ -50,14 +50,14 @@ def load_celeb_faces():
             if not filename.lower().endswith((".jpg", ".jpeg", ".png")):
                 continue  # Skip non-image files like .DS_Store
             
-        image_path = os.path.join(celeb_path, filename)
-        try:
-            image = face_recognition.load_image_file(image_path)
-            encodings = face_recognition.face_encodings(image)
-            if encodings:
-                celeb_encodings.append((encodings[0], celeb_name, image_path))
-        except Exception as e:
-            print(f"Error loading celeb image {image_path}: {e}")
+            image_path = os.path.join(celeb_path, filename)
+            try:
+                image = face_recognition.load_image_file(image_path)
+                encodings = face_recognition.face_encodings(image)
+                if encodings:
+                    celeb_encodings.append((encodings[0], celeb_name, image_path))
+            except Exception as e:
+                print(f"Error loading celeb image {image_path}: {e}")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -198,14 +198,14 @@ async def send_similarity_map(update: Update):
         await update.message.reply_text("I need at least 2 faces to generate a map.", reply_markup=keyboard)
         return
 
-    # Reduce to 2D
+    # Reduce to 2D with PCA
     pca = PCA(n_components=2)
     coords = pca.fit_transform(encodings)
     coords -= coords.min(axis=0)
     coords /= coords.max(axis=0)
-    coords *= 800  # canvas size
+    coords *= 800  # Scale to canvas
 
-    # Draw
+    # Create canvas
     canvas = Image.new('RGB', (850, 850), 'white')
     for (x, y), image, label in zip(coords, images, labels):
         face_locations = face_recognition.face_locations(image)
@@ -216,10 +216,15 @@ async def send_similarity_map(update: Update):
         face = face.resize((64, 64))
         canvas.paste(face, (int(x), int(y)))
 
+    # Save map to buffer and send
     output = io.BytesIO()
     canvas.save(output, format="PNG")
     output.seek(0)
-    await update.message.reply_photo(photo=output, caption="Here's a map of all known faces", reply_markup=keyboard)
+
+    await update.message.reply_photo(photo=output, caption="Here's a map of all known faces")
+
+    # 🔥 Force keyboard to come back
+    await update.message.reply_text("What would you like to do next?", reply_markup=keyboard)
 
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 
