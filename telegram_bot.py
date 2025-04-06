@@ -44,7 +44,7 @@ WAITING_FOR_RECOGNITION_IMAGE = 3
 WAITING_FOR_CELEB_LOOKALIKE_IMAGE = 4
 
 # Startup cache
-celeb_encodings = []
+celeb_data = []  # list of dicts with keys: name, mean_encoding, photo_encodings, image_paths
 celeb_coords = []
 celeb_images = []
 celeb_labels = []
@@ -57,26 +57,47 @@ user_names = []
 
 # Load celeb data
 def load_celeb_faces():
-    global celeb_encodings, celeb_coords, celeb_images, celeb_labels, pca_model
+    global celeb_data, celeb_coords, celeb_images, celeb_labels, pca_model
+
+    celeb_encodings = []
 
     for celeb_name in os.listdir(CELEB_DIR):
         celeb_path = os.path.join(CELEB_DIR, celeb_name)
         if not os.path.isdir(celeb_path):
             continue
+
+        encodings = []
+        paths = []
+        images = []
+
         for filename in os.listdir(celeb_path):
             if not filename.lower().endswith(('.jpg', '.jpeg', '.png')):
                 continue
             image_path = os.path.join(celeb_path, filename)
             try:
                 image = face_recognition.load_image_file(image_path)
-                encodings = face_recognition.face_encodings(image)
-                if encodings:
-                    celeb_encodings.append(encodings[0])
-                    celeb_images.append(image)
-                    celeb_labels.append(celeb_name)
+                encoding = face_recognition.face_encodings(image)
+                if encoding:
+                    encodings.append(encoding[0])
+                    paths.append(image_path)
+                    images.append(image)
             except Exception as e:
                 print(f"Error loading celeb image {image_path}: {e}")
 
+        if encodings:
+            mean_encoding = np.mean(encodings, axis=0)
+            celeb_data.append({
+                'name': celeb_name,
+                'mean_encoding': mean_encoding,
+                'photo_encodings': encodings,
+                'image_paths': paths,
+                'images': images
+            })
+            celeb_encodings.append(mean_encoding)
+            celeb_labels.append(celeb_name)
+            celeb_images.append(images[0])  # just one for map
+
+    # PCA map based on means
     pca_model = PCA(n_components=2)
     celeb_coords = pca_model.fit_transform(celeb_encodings)
     celeb_coords -= celeb_coords.min(axis=0)
@@ -86,11 +107,8 @@ def load_celeb_faces():
     joblib.dump(pca_model, PCA_MODEL_PATH)
     with open("celeb_coords.npy", "wb") as f:
         np.save(f, celeb_coords)
-    with open("celeb_images.pkl", "wb") as f:
-        pickle.dump(celeb_images, f)
     with open("celeb_labels.pkl", "wb") as f:
         pickle.dump(celeb_labels, f)
-
     generate_celeb_map()
 
 # Create celeb map image
@@ -154,6 +172,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Upload an image with a single face")
         return
 
+    elif text == 'Similar celebs':
+        user_state[user_id] = WAITING_FOR_CELEB_LOOKALIKE_IMAGE
+        await update.message.reply_text("Upload me a picture of a single person and I will find which celebs are similar to that person")
+        return
+
     elif text == 'Map':
         await send_combined_map(update)
         return
@@ -175,6 +198,39 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['new_face_image'] = image
         await update.message.reply_text("Great. What's the name of the person in this image?")
         user_state[user_id] = WAITING_FOR_NAME
+
+    elif state == WAITING_FOR_CELEB_LOOKALIKE_IMAGE:
+        encodings = face_recognition.face_encodings(image)
+        if not encodings:
+            await update.message.reply_text("I couldn't detect any face in the image.", reply_markup=keyboard)
+            user_state[user_id] = None
+            return
+
+        query_encoding = encodings[0]
+
+        # Find closest celeb mean
+        best_match = None
+        best_distance = float('inf')
+
+        for celeb in celeb_data:
+            distance = np.linalg.norm(query_encoding - celeb['mean_encoding'])
+            if distance < best_distance:
+                best_distance = distance
+                best_match = celeb
+
+        if best_match:
+            best_photo_index = np.argmin([np.linalg.norm(query_encoding - e) for e in best_match['photo_encodings']])
+            best_path = best_match['image_paths'][best_photo_index]
+            with open(best_path, 'rb') as img_file:
+                await update.message.reply_photo(
+                    photo=img_file,
+                    caption=f"The celeb that the person is most similar to is: {best_match['name'].replace('_', ' ').title()}",
+                    reply_markup=keyboard
+                )
+        else:
+            await update.message.reply_text("I couldn't find a similar celeb.", reply_markup=keyboard)
+
+        user_state[user_id] = None
 
 # Send final map
 async def send_combined_map(update: Update):
