@@ -12,6 +12,7 @@ from telegram.ext import (
 )
 from dotenv import load_dotenv
 from sklearn.decomposition import PCA
+from image_analysis import generate_caption, recognize_faces, image_to_base64
 
 # Load token from .env
 load_dotenv()
@@ -23,7 +24,8 @@ keyboard = ReplyKeyboardMarkup([
     ['Recognize faces'],
     ['Reset faces'],
     ['Similar celebs'],
-    ['Map']
+    ['Map'],
+    ['Describe image']
 ], resize_keyboard=True)
 
 # Paths
@@ -36,26 +38,26 @@ USER_IMAGES_PATH = "user_images.pkl"
 # In-memory
 user_state = {}
 known_face_names = []
+known_face_encodings = []
 
 # States
 WAITING_FOR_IMAGE = 1
 WAITING_FOR_NAME = 2
 WAITING_FOR_RECOGNITION_IMAGE = 3
 WAITING_FOR_CELEB_LOOKALIKE_IMAGE = 4
+WAITING_FOR_IMAGE_DESCRIPTION = 5
 
 # Startup cache
-celeb_data = []  # list of dicts with keys: name, mean_encoding, photo_encodings, image_paths
+celeb_data = []
 celeb_coords = []
 celeb_images = []
 celeb_labels = []
 pca_model = None
 
-# Cache user face data
 user_coords = []
 user_images = []
 user_names = []
 
-# Load celeb data
 def load_celeb_faces():
     global celeb_data, celeb_coords, celeb_images, celeb_labels, pca_model
 
@@ -95,9 +97,8 @@ def load_celeb_faces():
             })
             celeb_encodings.append(mean_encoding)
             celeb_labels.append(celeb_name)
-            celeb_images.append(images[0])  # just one for map
+            celeb_images.append(images[0])
 
-    # PCA map based on means
     pca_model = PCA(n_components=2)
     celeb_coords = pca_model.fit_transform(celeb_encodings)
     celeb_coords -= celeb_coords.min(axis=0)
@@ -111,7 +112,6 @@ def load_celeb_faces():
         pickle.dump(celeb_labels, f)
     generate_celeb_map()
 
-# Create celeb map image
 def generate_celeb_map():
     canvas = Image.new('RGB', (850, 850), 'white')
     for (x, y), image in zip(celeb_coords, celeb_images):
@@ -124,14 +124,12 @@ def generate_celeb_map():
         canvas.paste(face, (int(x), int(y)))
     canvas.save(CELEB_MAP_PATH)
 
-# Save user face data
 def save_user_face_data():
     with open(USER_COORDS_PATH, "wb") as f:
         np.save(f, np.array(user_coords))
     with open(USER_IMAGES_PATH, "wb") as f:
         pickle.dump(user_images, f)
 
-# Load user face data
 def load_user_face_data():
     global user_coords, user_images
     if os.path.exists(USER_COORDS_PATH):
@@ -140,12 +138,10 @@ def load_user_face_data():
         with open(USER_IMAGES_PATH, "rb") as f:
             user_images.extend(pickle.load(f))
 
-# Start command
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Choose an option:", reply_markup=keyboard)
     user_state[update.effective_user.id] = None
 
-# Handle menu text
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     user_id = update.effective_user.id
@@ -162,6 +158,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_coords.append(coords)
             user_images.append(image)
             known_face_names.append(name)
+            known_face_encodings.append(encoding)
             save_user_face_data()
             await update.message.reply_text(f"Great. I will now remember this face as {name}.", reply_markup=keyboard)
         user_state[user_id] = None
@@ -181,7 +178,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_combined_map(update)
         return
 
-# Handle user image
+    elif text == 'Describe image':
+        user_state[user_id] = WAITING_FOR_IMAGE_DESCRIPTION
+        await update.message.reply_text("Upload an image and I will describe it for you.")
+        return
+
+    elif text == 'Recognize faces':
+        user_state[user_id] = WAITING_FOR_RECOGNITION_IMAGE
+        await update.message.reply_text("Upload an image with at least one face and I will recognize who is in this image.")
+        return
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     photo_file = await update.message.photo[-1].get_file()
@@ -199,6 +205,61 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Great. What's the name of the person in this image?")
         user_state[user_id] = WAITING_FOR_NAME
 
+    elif state == WAITING_FOR_RECOGNITION_IMAGE:
+        path = f"/tmp/{update.message.photo[-1].file_id}.jpg"
+        with open(path, "wb") as f:
+            f.write(photo_bytes)
+
+        image_np = face_recognition.load_image_file(path)
+        face_locations = face_recognition.face_locations(image_np)
+        face_encodings = face_recognition.face_encodings(image_np, face_locations)
+
+        pil_image = Image.fromarray(image_np)
+        draw = ImageDraw.Draw(pil_image)
+
+        recognized_names = []
+
+        for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
+            matches = face_recognition.compare_faces(known_face_encodings, face_encoding)
+            face_distances = face_recognition.face_distance(known_face_encodings, face_encoding)
+            if any(matches):
+                best_match_index = face_distances.argmin()
+                name = known_face_names[best_match_index]
+                recognized_names.append(name)
+                draw.rectangle(((left, top), (right, bottom)), outline="blue", width=3)
+                draw.text((left, top - 10), name, fill="blue")
+
+        output = io.BytesIO()
+        pil_image.save(output, format="JPEG")
+        output.seek(0)
+
+        if recognized_names:
+            await update.message.reply_photo(
+                photo=output,
+                caption=f"I found {len(recognized_names)} face(s) in this image and the people are: {', '.join(recognized_names)}",
+                reply_markup=keyboard
+            )
+        else:
+            await update.message.reply_text("I don’t recognize anyone in this image.", reply_markup=keyboard)
+
+        user_state[user_id] = None
+
+    elif state == WAITING_FOR_IMAGE_DESCRIPTION:
+        path = f"/tmp/{update.message.photo[-1].file_id}.jpg"
+        with open(path, "wb") as f:
+            f.write(photo_bytes)
+
+        caption = generate_caption(path)
+        names = recognize_faces(path, known_face_encodings, known_face_names)
+        if names:
+            name_str = ", ".join(names)
+            full_caption = f"{caption}\n\nAlso, I recognized: {name_str}"
+        else:
+            full_caption = caption + "\n\nI didn’t recognize anyone."
+
+        await update.message.reply_text(full_caption, reply_markup=keyboard)
+        user_state[user_id] = None
+
     elif state == WAITING_FOR_CELEB_LOOKALIKE_IMAGE:
         encodings = face_recognition.face_encodings(image)
         if not encodings:
@@ -207,8 +268,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         query_encoding = encodings[0]
-
-        # Find closest celeb mean
         best_match = None
         best_distance = float('inf')
 
@@ -232,7 +291,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         user_state[user_id] = None
 
-# Send final map
 async def send_combined_map(update: Update):
     canvas = Image.open(CELEB_MAP_PATH).copy()
     for (x, y), image in zip(user_coords, user_images):
@@ -249,7 +307,6 @@ async def send_combined_map(update: Update):
     output.seek(0)
     await update.message.reply_photo(photo=output, caption="Here's a combined map of celebs and user faces", reply_markup=keyboard)
 
-# App setup
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
