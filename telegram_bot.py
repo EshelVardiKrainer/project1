@@ -187,6 +187,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_state[user_id] = WAITING_FOR_RECOGNITION_IMAGE
         await update.message.reply_text("Upload an image with at least one face and I will recognize who is in this image.")
         return
+    
+    # Fallback if the command isn't recognized
+    await update.message.reply_text("I didn’t understand that. Please choose an option from the menu:", reply_markup=keyboard)
+    user_state[user_id] = None
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -261,13 +265,22 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_state[user_id] = None
 
     elif state == WAITING_FOR_CELEB_LOOKALIKE_IMAGE:
-        encodings = face_recognition.face_encodings(image)
-        if not encodings:
-            await update.message.reply_text("I couldn't detect any face in the image.", reply_markup=keyboard)
+        face_locations = face_recognition.face_locations(image)
+        face_encodings = face_recognition.face_encodings(image, face_locations)
+
+        if not face_encodings:
+            await update.message.reply_text("There are no faces in this photo.", reply_markup=keyboard)
             user_state[user_id] = None
             return
 
-        query_encoding = encodings[0]
+        if len(face_encodings) > 1:
+            await update.message.reply_text("There are more than one face in this photo. Please upload an image with just one face.", reply_markup=keyboard)
+            user_state[user_id] = None
+            return
+
+        query_encoding = face_encodings[0]
+
+        # Find closest celeb mean
         best_match = None
         best_distance = float('inf')
 
@@ -278,8 +291,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 best_match = celeb
 
         if best_match:
-            best_photo_index = np.argmin([np.linalg.norm(query_encoding - e) for e in best_match['photo_encodings']])
+            best_photo_index = np.argmin([
+                np.linalg.norm(query_encoding - e)
+                for e in best_match['photo_encodings']
+            ])
             best_path = best_match['image_paths'][best_photo_index]
+
             with open(best_path, 'rb') as img_file:
                 await update.message.reply_photo(
                     photo=img_file,
@@ -290,6 +307,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("I couldn't find a similar celeb.", reply_markup=keyboard)
 
         user_state[user_id] = None
+
 
 async def send_combined_map(update: Update):
     canvas = Image.open(CELEB_MAP_PATH).copy()
