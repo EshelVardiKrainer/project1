@@ -13,6 +13,8 @@ from telegram.ext import (
 from dotenv import load_dotenv
 from sklearn.decomposition import PCA
 from image_analysis import generate_caption, recognize_faces, image_to_base64
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
 
 # Load token from .env
 load_dotenv()
@@ -53,13 +55,16 @@ celeb_coords = []
 celeb_images = []
 celeb_labels = []
 pca_model = None
+celeb_min = None
+celeb_max = None
 
 user_coords = []
 user_images = []
 user_names = []
 
+
 def load_celeb_faces():
-    global celeb_data, celeb_coords, celeb_images, celeb_labels, pca_model
+    global celeb_data, celeb_coords, celeb_images, celeb_labels, pca_model, celeb_min, celeb_max
 
     celeb_encodings = []
 
@@ -99,10 +104,15 @@ def load_celeb_faces():
             celeb_labels.append(celeb_name)
             celeb_images.append(images[0])
 
+    # PCA map based on means
     pca_model = PCA(n_components=2)
     celeb_coords = pca_model.fit_transform(celeb_encodings)
-    celeb_coords -= celeb_coords.min(axis=0)
-    celeb_coords /= celeb_coords.max(axis=0)
+
+    # Normalize using min/max
+    celeb_min = celeb_coords.min(axis=0)
+    celeb_max = celeb_coords.max(axis=0)
+
+    celeb_coords = (celeb_coords - celeb_min) / (celeb_max - celeb_min)
     celeb_coords *= 800
 
     joblib.dump(pca_model, PCA_MODEL_PATH)
@@ -110,33 +120,40 @@ def load_celeb_faces():
         np.save(f, celeb_coords)
     with open("celeb_labels.pkl", "wb") as f:
         pickle.dump(celeb_labels, f)
-    generate_celeb_map()
+    generate_face_map()
 
-def generate_celeb_map():
+
+def generate_face_map():
+    global celeb_coords
     canvas = Image.new('RGB', (850, 850), 'white')
-    for (x, y), image in zip(celeb_coords, celeb_images):
+
+    for celeb, coords in zip(celeb_data, celeb_coords):
+        image = celeb['images'][0]
         face_locations = face_recognition.face_locations(image)
         if not face_locations:
             continue
+
         top, right, bottom, left = face_locations[0]
         face = Image.fromarray(image[top:bottom, left:right])
         face = face.resize((64, 64))
-        canvas.paste(face, (int(x), int(y)))
+
+        x, y = coords
+        x = max(0, min(int(x), canvas.width - 64))
+        y = max(0, min(int(y), canvas.height - 64))
+
+        canvas.paste(face, (x, y))
+
     canvas.save(CELEB_MAP_PATH)
 
 def save_user_face_data():
     with open(USER_COORDS_PATH, "wb") as f:
         np.save(f, np.array(user_coords))
     with open(USER_IMAGES_PATH, "wb") as f:
-        pickle.dump(user_images, f)
-
-def load_user_face_data():
-    global user_coords, user_images
-    if os.path.exists(USER_COORDS_PATH):
-        user_coords = np.load(USER_COORDS_PATH).tolist()
-    if os.path.exists(USER_IMAGES_PATH):
-        with open(USER_IMAGES_PATH, "rb") as f:
-            user_images.extend(pickle.load(f))
+        pickle.dump({
+            "images": user_images,
+            "encodings": known_face_encodings,
+            "names": known_face_names,
+        }, f)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Choose an option:", reply_markup=keyboard)
@@ -147,20 +164,28 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
     if user_state.get(user_id) == WAITING_FOR_NAME:
+        global celeb_min, celeb_max
+
         name = text.strip()
         encoding = context.user_data.get('new_face_encoding')
         image = context.user_data.get('new_face_image')
+
         if encoding is not None and image is not None:
             coords = pca_model.transform([encoding])[0]
-            coords -= coords.min()
-            coords /= coords.max()
+            coords = (coords - celeb_min) / (celeb_max - celeb_min)
             coords *= 800
+
+            print(f"User normalized coords: {coords}")
+            print(f"Using celeb_min: {celeb_min}, celeb_max: {celeb_max}")
+
             user_coords.append(coords)
             user_images.append(image)
             known_face_names.append(name)
             known_face_encodings.append(encoding)
             save_user_face_data()
+
             await update.message.reply_text(f"Great. I will now remember this face as {name}.", reply_markup=keyboard)
+
         user_state[user_id] = None
         return
 
@@ -208,6 +233,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['new_face_image'] = image
         await update.message.reply_text("Great. What's the name of the person in this image?")
         user_state[user_id] = WAITING_FOR_NAME
+        print(f"Using celeb_min: {celeb_min}, celeb_max: {celeb_max}")
 
     elif state == WAITING_FOR_RECOGNITION_IMAGE:
         path = f"/tmp/{update.message.photo[-1].file_id}.jpg"
@@ -318,7 +344,16 @@ async def send_combined_map(update: Update):
         top, right, bottom, left = face_locations[0]
         face = Image.fromarray(image[top:bottom, left:right])
         face = face.resize((64, 64))
-        canvas.paste(face, (int(x), int(y)))
+
+        # Center the face around (x, y)
+        paste_x = int(x) - 32
+        paste_y = int(y) - 32
+
+        # Ensure the paste position is within bounds
+        paste_x = max(0, min(paste_x, canvas.width - 64))
+        paste_y = max(0, min(paste_y, canvas.height - 64))
+
+        canvas.paste(face, (paste_x, paste_y))
 
     output = io.BytesIO()
     canvas.save(output, format="PNG")
@@ -333,6 +368,5 @@ app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 if __name__ == '__main__':
     print("Loading celeb data and PCA...")
     load_celeb_faces()
-    load_user_face_data()
     print("Bot is running...")
     app.run_polling()
