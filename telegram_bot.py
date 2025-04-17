@@ -175,9 +175,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             coords = (coords - celeb_min) / (celeb_max - celeb_min)
             coords *= 800
 
-            print(f"User normalized coords: {coords}")
-            print(f"Using celeb_min: {celeb_min}, celeb_max: {celeb_max}")
-
             user_coords.append(coords)
             user_images.append(image)
             known_face_names.append(name)
@@ -212,6 +209,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_state[user_id] = WAITING_FOR_RECOGNITION_IMAGE
         await update.message.reply_text("Upload an image with at least one face and I will recognize who is in this image.")
         return
+    
+    elif text == 'Reset faces':
+        user_coords.clear()
+        user_images.clear()
+        known_face_names.clear()
+        known_face_encodings.clear()
+
+        # Optionally delete stored files on disk
+        for path in [USER_COORDS_PATH, USER_IMAGES_PATH]:
+            if os.path.exists(path):
+                os.remove(path)
+
+        await update.message.reply_text("All user faces have been reset.", reply_markup=keyboard)
+        user_state[user_id] = None
+        return
+
     
     # Fallback if the command isn't recognized
     await update.message.reply_text("I didn’t understand that. Please choose an option from the menu:", reply_markup=keyboard)
